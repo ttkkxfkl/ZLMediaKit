@@ -15,6 +15,9 @@
 #include "Player/MediaPlayer.h"
 #include "Util/TimeTicker.h"
 #include <memory>
+#include <vector>
+#include <limits>
+#include <cstdint>
 
 namespace mediakit {
 
@@ -158,6 +161,33 @@ private:
     void setDirectProxy();
     void setTranslationInfo();
 
+    struct PlaybackResume {
+        struct QueryItem {
+            std::string key;
+            std::string value;
+            bool has_value = false;
+        };
+
+        enum class TimezoneFormat { none, utc_z, offset_no_colon, offset_with_colon };
+
+        bool enabled = false;
+        std::string base;
+        std::string fragment;
+        std::vector<QueryItem> items;
+        size_t start_index = std::numeric_limits<size_t>::max();
+        size_t end_index = std::numeric_limits<size_t>::max();
+        int64_t initial_start = 0;
+        int64_t end_stamp = 0;
+        int tz_offset = 0;
+        TimezoneFormat tz_format = TimezoneFormat::none;
+        uint64_t total_progress_seconds = 0;
+        std::string last_url;
+    };
+
+    void initPlaybackResume(const std::string &url);
+    std::string buildPlaybackUrl(const std::string &origin_url);
+    std::string assemblePlaybackUrl() const;
+
 private:
     int _retry_count;
     int _reconnect_delay_min;
@@ -173,6 +203,7 @@ private:
     std::function<void(const toolkit::SockException &ex)> _on_play;
     TranslationInfo _transtalion_info;
     MultiMediaSourceMuxer::Ptr _muxer;
+    PlaybackResume _playback_resume;
 
     toolkit::Ticker _live_ticker;
     // 0 表示正常 1 表示正在尝试拉流  [AUTO-TRANSLATED:2080bedf]
