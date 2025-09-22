@@ -79,6 +79,7 @@ const string kStreamNoneReaderDelayMS = GENERAL_FIELD "streamNoneReaderDelayMS";
 const string kMaxStreamWaitTimeMS = GENERAL_FIELD "maxStreamWaitMS";
 const string kEnableVhost = GENERAL_FIELD "enableVhost";
 const string kResetWhenRePlay = GENERAL_FIELD "resetWhenRePlay";
+const string kKeepReplayProgress = GENERAL_FIELD "keepReplayProgress";
 const string kMergeWriteMS = GENERAL_FIELD "mergeWriteMS";
 const string kCheckNvidiaDev = GENERAL_FIELD "check_nvidia_dev";
 const string kEnableFFmpegLog = GENERAL_FIELD "enable_ffmpeg_log";
@@ -95,6 +96,7 @@ static onceToken token([]() {
     mINI::Instance()[kMaxStreamWaitTimeMS] = 15 * 1000;
     mINI::Instance()[kEnableVhost] = 0;
     mINI::Instance()[kResetWhenRePlay] = 1;
+    mINI::Instance()[kKeepReplayProgress] = 0;
     mINI::Instance()[kMergeWriteMS] = 0;
     mINI::Instance()[kMediaServerId] = makeRandStr(16);
     mINI::Instance()[kCheckNvidiaDev] = 1;

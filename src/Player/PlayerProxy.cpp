@@ -17,11 +17,250 @@
 #include "Util/MD5.h"
 #include "Util/logger.h"
 #include "Util/mini.h"
+#include <algorithm>
+#include <cctype>
+#include <ctime>
+#include <cstdlib>
+#include <limits>
+#include <stdexcept>
 
 using namespace toolkit;
 using namespace std;
 
 namespace mediakit {
+
+namespace {
+
+using TimezoneFormat = PlayerProxy::PlaybackResume::TimezoneFormat;
+
+static bool isLeapYear(int year) {
+    if (year % 4 != 0) {
+        return false;
+    }
+    if (year % 100 != 0) {
+        return true;
+    }
+    return (year % 400) == 0;
+}
+
+static int daysInMonth(int year, int month) {
+    static const int kDaysInMonth[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    int days = kDaysInMonth[month];
+    if (month == 1 && isLeapYear(year)) {
+        ++days;
+    }
+    return days;
+}
+
+static int64_t tmToUtcSeconds(const std::tm &time) {
+    int64_t days = 0;
+    int year = time.tm_year + 1900;
+    if (year >= 1970) {
+        for (int y = 1970; y < year; ++y) {
+            days += isLeapYear(y) ? 366 : 365;
+        }
+    } else {
+        for (int y = 1969; y >= year; --y) {
+            days -= isLeapYear(y) ? 366 : 365;
+        }
+    }
+    static const int kCumulativeDays[] = { 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334 };
+    if (time.tm_mon >= 0 && time.tm_mon < 12) {
+        days += kCumulativeDays[time.tm_mon];
+        if (time.tm_mon > 1 && isLeapYear(year)) {
+            ++days;
+        }
+    }
+    days += time.tm_mday - 1;
+    return days * 86400 + time.tm_hour * 3600 + time.tm_min * 60 + time.tm_sec;
+}
+
+static std::tm utcSecondsToTm(int64_t seconds) {
+    std::tm result{};
+    int64_t days = seconds / 86400;
+    int64_t remain = seconds % 86400;
+    if (remain < 0) {
+        remain += 86400;
+        --days;
+    }
+    result.tm_hour = static_cast<int>(remain / 3600);
+    remain %= 3600;
+    result.tm_min = static_cast<int>(remain / 60);
+    result.tm_sec = static_cast<int>(remain % 60);
+
+    int year = 1970;
+    if (days >= 0) {
+        while (true) {
+            int days_in_year = isLeapYear(year) ? 366 : 365;
+            if (days >= days_in_year) {
+                days -= days_in_year;
+                ++year;
+            } else {
+                break;
+            }
+        }
+    } else {
+        while (days < 0) {
+            --year;
+            days += isLeapYear(year) ? 366 : 365;
+        }
+    }
+
+    int month = 0;
+    while (month < 12) {
+        int dim = daysInMonth(year, month);
+        if (days >= dim) {
+            days -= dim;
+            ++month;
+        } else {
+            break;
+        }
+    }
+
+    result.tm_year = year - 1900;
+    result.tm_mon = month;
+    result.tm_mday = static_cast<int>(days) + 1;
+    return result;
+}
+
+static std::string formatPlaybackTime(int64_t utc_seconds, TimezoneFormat format, int tz_offset) {
+    int64_t local_seconds = utc_seconds;
+    if (format == TimezoneFormat::offset_no_colon || format == TimezoneFormat::offset_with_colon) {
+        local_seconds += tz_offset;
+    }
+    auto local_tm = utcSecondsToTm(local_seconds);
+    char buf[32];
+    snprintf(buf, sizeof(buf), "%04d%02d%02dT%02d%02d%02d",
+             local_tm.tm_year + 1900,
+             local_tm.tm_mon + 1,
+             local_tm.tm_mday,
+             local_tm.tm_hour,
+             local_tm.tm_min,
+             local_tm.tm_sec);
+    std::string result(buf);
+    switch (format) {
+    case TimezoneFormat::utc_z:
+        result.push_back('Z');
+        break;
+    case TimezoneFormat::offset_no_colon:
+    case TimezoneFormat::offset_with_colon: {
+        int total = tz_offset;
+        char sign = total >= 0 ? '+' : '-';
+        total = std::abs(total);
+        int hours = total / 3600;
+        int minutes = (total % 3600) / 60;
+        char tz_buf[8];
+        if (format == TimezoneFormat::offset_with_colon) {
+            snprintf(tz_buf, sizeof(tz_buf), "%c%02d:%02d", sign, hours, minutes);
+        } else {
+            snprintf(tz_buf, sizeof(tz_buf), "%c%02d%02d", sign, hours, minutes);
+        }
+        result.append(tz_buf);
+        break;
+    }
+    case TimezoneFormat::none:
+        break;
+    }
+    return result;
+}
+
+static bool parsePlaybackTime(const std::string &value, int64_t &utc_seconds, TimezoneFormat &format, int &tz_offset) {
+    format = TimezoneFormat::none;
+    tz_offset = 0;
+    if (value.size() < 15) {
+        return false;
+    }
+    std::string work = value;
+    if (!work.empty()) {
+        char last = work.back();
+        if (last == 'Z' || last == 'z') {
+            format = TimezoneFormat::utc_z;
+            work.pop_back();
+        } else {
+            auto pos = work.find_last_of("+-");
+            if (pos != std::string::npos && pos > 8) {
+                std::string tz_part = work.substr(pos);
+                bool has_colon = tz_part.find(':') != std::string::npos;
+                int sign = 1;
+                if (tz_part[0] == '+') {
+                    sign = 1;
+                } else if (tz_part[0] == '-') {
+                    sign = -1;
+                } else {
+                    return false;
+                }
+                std::string digits;
+                for (size_t i = 1; i < tz_part.size(); ++i) {
+                    if (tz_part[i] == ':') {
+                        continue;
+                    }
+                    if (!isdigit(static_cast<unsigned char>(tz_part[i]))) {
+                        return false;
+                    }
+                    digits.push_back(tz_part[i]);
+                }
+                if (digits.size() != 4) {
+                    return false;
+                }
+                int hours = 0;
+                int minutes = 0;
+                try {
+                    hours = std::stoi(digits.substr(0, 2));
+                    minutes = std::stoi(digits.substr(2, 2));
+                } catch (const std::exception &) {
+                    return false;
+                }
+                if (minutes >= 60) {
+                    return false;
+                }
+                tz_offset = sign * (hours * 3600 + minutes * 60);
+                format = has_colon ? TimezoneFormat::offset_with_colon : TimezoneFormat::offset_no_colon;
+                work = work.substr(0, pos);
+            }
+        }
+    }
+    if (work.size() != 15 || work[8] != 'T') {
+        return false;
+    }
+    for (size_t i = 0; i < work.size(); ++i) {
+        if (i == 8) {
+            continue;
+        }
+        if (!isdigit(static_cast<unsigned char>(work[i]))) {
+            return false;
+        }
+    }
+    std::tm time{};
+    try {
+        time.tm_year = std::stoi(work.substr(0, 4)) - 1900;
+        time.tm_mon = std::stoi(work.substr(4, 2)) - 1;
+        time.tm_mday = std::stoi(work.substr(6, 2));
+        time.tm_hour = std::stoi(work.substr(9, 2));
+        time.tm_min = std::stoi(work.substr(11, 2));
+        time.tm_sec = std::stoi(work.substr(13, 2));
+    } catch (const std::exception &) {
+        return false;
+    }
+    int year = time.tm_year + 1900;
+    if (time.tm_mon < 0 || time.tm_mon > 11) {
+        return false;
+    }
+    if (time.tm_mday < 1 || time.tm_mday > daysInMonth(year, time.tm_mon)) {
+        return false;
+    }
+    if (time.tm_hour < 0 || time.tm_hour > 23 || time.tm_min < 0 || time.tm_min > 59 || time.tm_sec < 0 || time.tm_sec > 60) {
+        return false;
+    }
+    utc_seconds = tmToUtcSeconds(time) - tz_offset;
+    return true;
+}
+
+static std::string toLowerCopy(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return std::tolower(c); });
+    return text;
+}
+
+} // namespace
 
 PlayerProxy::PlayerProxy(
     const MediaTuple &tuple, const ProtocolOption &option, int retry_count,
@@ -102,6 +341,7 @@ static int getMaxTrackSize(const std::string &url) {
 }
 
 void PlayerProxy::play(const string &strUrlTmp) {
+    initPlaybackResume(strUrlTmp);
     _option.max_track = getMaxTrackSize(strUrlTmp);
     weak_ptr<PlayerProxy> weakSelf = shared_from_this();
     std::shared_ptr<int> piFailedCnt(new int(0)); // 连续播放失败次数
@@ -127,9 +367,9 @@ void PlayerProxy::play(const string &strUrlTmp) {
             *piFailedCnt = 0; // 连续播放失败次数清0
             strongSelf->onPlaySuccess();
             strongSelf->setTranslationInfo();
-            strongSelf->_on_connect(strongSelf->_transtalion_info);  
+            strongSelf->_on_connect(strongSelf->_transtalion_info);
 
-            InfoL << "play " << strUrlTmp << " success";
+            InfoL << "play " << strongSelf->_pull_url << " success";
         } else if (*piFailedCnt < strongSelf->_retry_count || strongSelf->_retry_count < 0) {
             // 播放失败，延时重试播放  [AUTO-TRANSLATED:d7537c9c]
             // Play failed, retry playing with delay
@@ -184,14 +424,15 @@ void PlayerProxy::play(const string &strUrlTmp) {
             strongSelf->_on_close(err);
         }
     });
+    auto first_url = _playback_resume.last_url.empty() ? strUrlTmp : _playback_resume.last_url;
     try {
-        MediaPlayer::play(strUrlTmp);
+        MediaPlayer::play(first_url);
     } catch (std::exception &ex) {
         ErrorL << ex.what();
         onPlayResult(SockException(Err_other, ex.what()));
         return;
     }
-    _pull_url = strUrlTmp;
+    _pull_url = first_url;
     setDirectProxy();
 }
 
@@ -215,6 +456,139 @@ void PlayerProxy::setDirectProxy() {
     if (mediaSource) {
         setMediaSource(mediaSource);
     }
+}
+
+void PlayerProxy::initPlaybackResume(const std::string &url) {
+    GET_CONFIG(bool, keep_replay_progress, General::kKeepReplayProgress);
+    _playback_resume = PlaybackResume();
+    _playback_resume.last_url = url;
+    if (!keep_replay_progress) {
+        return;
+    }
+
+    _playback_resume.enabled = true;
+    std::string working = url;
+    auto fragment_pos = working.find('#');
+    if (fragment_pos != std::string::npos) {
+        _playback_resume.fragment = working.substr(fragment_pos);
+        working = working.substr(0, fragment_pos);
+    }
+
+    auto query_pos = working.find('?');
+    if (query_pos == std::string::npos) {
+        _playback_resume.base = working;
+        _playback_resume.enabled = false;
+        return;
+    }
+
+    _playback_resume.base = working.substr(0, query_pos);
+    std::string query = working.substr(query_pos + 1);
+    bool found_start = false;
+    bool parse_error = false;
+
+    size_t pos = 0;
+    while (pos <= query.size()) {
+        size_t next = query.find('&', pos);
+        std::string token = query.substr(pos, next == std::string::npos ? std::string::npos : next - pos);
+        if (!token.empty()) {
+            PlaybackResume::QueryItem item;
+            auto equal_pos = token.find('=');
+            if (equal_pos != std::string::npos) {
+                item.key = token.substr(0, equal_pos);
+                item.value = token.substr(equal_pos + 1);
+                item.has_value = true;
+            } else {
+                item.key = token;
+            }
+
+            auto lower_key = toLowerCopy(item.key);
+            if (!found_start && lower_key == "starttime" && item.has_value) {
+                int64_t stamp = 0;
+                int tz_offset = 0;
+                auto format = TimezoneFormat::none;
+                if (parsePlaybackTime(item.value, stamp, format, tz_offset)) {
+                    _playback_resume.initial_start = stamp;
+                    _playback_resume.tz_format = format;
+                    _playback_resume.tz_offset = tz_offset;
+                    _playback_resume.start_index = _playback_resume.items.size();
+                    found_start = true;
+                } else {
+                    parse_error = true;
+                }
+            } else if (lower_key == "endtime" && item.has_value) {
+                int64_t end_stamp = 0;
+                int tz_tmp = 0;
+                auto format_tmp = TimezoneFormat::none;
+                if (parsePlaybackTime(item.value, end_stamp, format_tmp, tz_tmp)) {
+                    _playback_resume.end_stamp = end_stamp;
+                    _playback_resume.end_index = _playback_resume.items.size();
+                }
+            }
+            _playback_resume.items.emplace_back(std::move(item));
+        }
+
+        if (next == std::string::npos) {
+            break;
+        }
+        pos = next + 1;
+    }
+
+    if (!found_start || parse_error) {
+        _playback_resume.enabled = false;
+    }
+}
+
+std::string PlayerProxy::assemblePlaybackUrl() const {
+    if (!_playback_resume.enabled) {
+        return _playback_resume.last_url;
+    }
+    _StrPrinter printer;
+    printer << _playback_resume.base;
+    bool appended = false;
+    for (const auto &item : _playback_resume.items) {
+        printer << (appended ? "&" : "?");
+        appended = true;
+        printer << item.key;
+        if (item.has_value) {
+            printer << "=" << item.value;
+        }
+    }
+    if (!appended) {
+        return _playback_resume.last_url;
+    }
+    printer << _playback_resume.fragment;
+    return printer;
+}
+
+std::string PlayerProxy::buildPlaybackUrl(const std::string &origin_url) {
+    if (!_playback_resume.enabled || _playback_resume.start_index == std::numeric_limits<size_t>::max()) {
+        return !_playback_resume.last_url.empty() ? _playback_resume.last_url : origin_url;
+    }
+
+    auto delegate = getDelegate();
+    uint64_t progress_seconds = delegate ? delegate->getProgressPos() : 0;
+    _playback_resume.total_progress_seconds += progress_seconds;
+    int64_t new_start = _playback_resume.initial_start + static_cast<int64_t>(_playback_resume.total_progress_seconds);
+    if (_playback_resume.end_stamp > 0 && new_start >= _playback_resume.end_stamp) {
+        if (_playback_resume.end_stamp > _playback_resume.initial_start) {
+            new_start = _playback_resume.end_stamp - 1;
+        } else {
+            new_start = _playback_resume.initial_start;
+        }
+    }
+    if (new_start < _playback_resume.initial_start) {
+        new_start = _playback_resume.initial_start;
+    }
+
+    _playback_resume.items[_playback_resume.start_index].value =
+        formatPlaybackTime(new_start, _playback_resume.tz_format, _playback_resume.tz_offset);
+    _playback_resume.items[_playback_resume.start_index].has_value = true;
+
+    auto new_url = assemblePlaybackUrl();
+    if (!new_url.empty()) {
+        _playback_resume.last_url = new_url;
+    }
+    return !_playback_resume.last_url.empty() ? _playback_resume.last_url : origin_url;
 }
 
 PlayerProxy::~PlayerProxy() {
@@ -243,8 +617,10 @@ void PlayerProxy::rePlay(const string &strUrl, int iFailedCnt) {
             if (!strongPlayer) {
                 return false;
             }
-            WarnL << "重试播放[" << iFailedCnt << "]:" << strUrl;
-            strongPlayer->MediaPlayer::play(strUrl);
+            auto retry_url = strongPlayer->buildPlaybackUrl(strUrl);
+            WarnL << "重试播放[" << iFailedCnt << "]:" << retry_url;
+            strongPlayer->MediaPlayer::play(retry_url);
+            strongPlayer->_pull_url = retry_url;
             strongPlayer->setDirectProxy();
             return false;
         },

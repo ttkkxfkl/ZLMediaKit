@@ -231,6 +231,7 @@ extern const std::string kEnableVhost;
 // 如果不删除将会接着上一次的数据继续写(录制hls/mp4时会继续在前一个文件后面写)  [AUTO-TRANSLATED:21a5be7e]
 // If not deleted, it will continue to write from the previous data (when recording hls/mp4, it will continue to write after the previous file)
 extern const std::string kResetWhenRePlay;
+extern const std::string kKeepReplayProgress;
 // 合并写缓存大小(单位毫秒)，合并写指服务器缓存一定的数据后才会一次性写入socket，这样能提高性能，但是会提高延时  [AUTO-TRANSLATED:6cc6fcf7]
 // Merge write cache size (unit milliseconds), merge write refers to the server caching a certain amount of data before writing to the socket at once, which can improve performance but increase latency
 // 开启后会同时关闭TCP_NODELAY并开启MSG_MORE  [AUTO-TRANSLATED:953b82cf]
